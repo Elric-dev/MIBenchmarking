@@ -445,8 +445,7 @@ def main():
         assert_grid_matches_pipeline(name, g)
 
     # Subjects
-    #AVAILABLE_SUBJECTS = [list(BNCI2014_001().subject_list)[0]]
-    AVAILABLE_SUBJECTS = list(input('Enter subject numbers NOT separated by commas (e.g. 123): '))
+    AVAILABLE_SUBJECTS = list(BNCI2014_001().subject_list)
     subjects = parse_subjects(args.subjects, AVAILABLE_SUBJECTS)
     if not subjects:
         raise RuntimeError("No valid subjects to run.")
@@ -456,6 +455,7 @@ def main():
     # Loop subjects
     start_all = time.perf_counter()
     for subj in subjects:
+        subj = int(subj)
         # Skip if checkpoint exists (still write predictions if missing)
         ck = ck_path(subj)
         if args.resume and os.path.exists(ck):
