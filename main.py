@@ -65,34 +65,7 @@ RANDOM_STATE = 42
 
 # -------------------- Shared-preprocessing transformers --------------------
 from filters import FBFilter  # defined in filters.py
-
-
-class CSPBank(BaseEstimator, TransformerMixin):
-    """
-    One CSP per band on the list produced by FBFilter; concatenates features.
-    """
-    def __init__(self, n_components=4, log=True, reg="oas"):
-        self.n_components = n_components  # keep as passed
-        self.log = log
-        self.reg = reg
-
-    def fit(self, X_bands, y):
-        from mne.decoding import CSP
-        n_comp = int(self.n_components)   # cast at fit-time
-        log = bool(self.log)
-        reg = self.reg
-
-        self.csps_ = []
-        for Xf in X_bands:
-            csp = CSP(n_components=n_comp, log=log, reg=reg)
-            csp.fit(Xf, y)
-            self.csps_.append(csp)
-        return self
-
-    def transform(self, X_bands):
-        import numpy as np
-        feats = [csp.transform(Xf) for csp, Xf in zip(self.csps_, X_bands)]
-        return np.hstack(feats)
+from filters import CSPBank   # defined in filters.py
 
 
 # -------------------- Helpers --------------------
@@ -472,7 +445,8 @@ def main():
         assert_grid_matches_pipeline(name, g)
 
     # Subjects
-    AVAILABLE_SUBJECTS = list(BNCI2014_001().subject_list)
+    #AVAILABLE_SUBJECTS = [list(BNCI2014_001().subject_list)[0]]
+    AVAILABLE_SUBJECTS = list(input('Enter subject numbers NOT separated by commas (e.g. 123): '))
     subjects = parse_subjects(args.subjects, AVAILABLE_SUBJECTS)
     if not subjects:
         raise RuntimeError("No valid subjects to run.")
