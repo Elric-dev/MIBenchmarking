@@ -1,24 +1,28 @@
-# train_bnci.py
 """
-BNCI2014_001 training with shared-preprocessing cache (parallel-safe on Linux):
-- Keeps EXACT same ML logic (pipelines, grids, SelectKBest, CV, outputs)
-- Controls parallelism centrally to avoid nested pools & thread oversubscription
-- Defaults to INNER-only parallelism (GridSearchCV uses all cores, MOABB outer CV uses 1)
-- Can choose --parallel_mode outer or both; total workers capped to --n_jobs
+BNCI2014_001 training with shared-preprocessing cache:
+- Split FB-CSP into FBFilter (stateless band-pass) + CSPBank (fits CSP), enabling joblib Pipeline cache reuse
+- GridSearchCV inner-CV parallelized (n_jobs), with verbose progress and throttled dispatch
+- Saves MOABB WithinSession outer-CV results per subject
+- Saves inner-CV cv_results_ per subject/pipeline
+- Writes per-trial predictions:
+    * OUTER test predictions (always)
+    * Optional INNER validation predictions for tuned hyper-params (best_params), per outer fold
+  Supports incremental append so CSV grows per fold/pipeline
+
+Portable: Linux & macOS (Apple Accelerate / vecLib respected). Headless-safe (Agg backend).
 """
 
 import os, sys, platform, warnings, json, time, glob, gc, pickle, traceback, argparse
-from contextlib import nullcontext
 from datetime import datetime
 warnings.filterwarnings("ignore")
 
 # -------------------- Threading & cache env (portable) --------------------
-# We'll still set these as a baseline; dynamic limits are applied below with threadpoolctl.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")  # no-op on Linux
+# macOS Accelerate/vecLib threads (no-op on Linux)
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
 JOBLIB_TEMP_FOLDER = os.environ.get("JOBLIB_TEMP_FOLDER", "/tmp/joblib")
 SKCACHE_DIR        = os.environ.get("SKCACHE_DIR", "/tmp/skcache")
@@ -34,7 +38,12 @@ import numpy as np
 import pandas as pd
 import joblib
 from joblib import parallel_backend
-from threadpoolctl import threadpool_limits
+try:
+    from threadpoolctl import threadpool_limits, threadpool_info
+except Exception:  # threadpoolctl optional
+    threadpool_limits = None
+    threadpool_info = None
+
 import matplotlib
 matplotlib.use("Agg")  # headless
 
@@ -50,7 +59,7 @@ from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC, LinearSVC
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 
 try:
     from mord import LogisticIT
@@ -63,6 +72,33 @@ RANDOM_STATE = 42
 # -------------------- Shared-preprocessing transformers --------------------
 from filters import FBFilter  # defined in filters.py
 from filters import CSPBank   # defined in filters.py
+
+
+# -------------------- Parallelism knobs (logic-preserving) --------------------
+CPU_COUNT = os.cpu_count() or 8
+DEFAULT_GRID_JOBS = str(min(max(1, CPU_COUNT // 2), CPU_COUNT))
+GRID_JOBS = int(os.environ.get("GRIDSEARCH_NJOBS", DEFAULT_GRID_JOBS))  # joblib workers inside GridSearchCV
+BLAS_PER_JOB = int(os.environ.get("BLAS_PER_JOB", "5"))                 # OpenBLAS/MKL threads per worker
+JOBLIB_BACKEND = os.environ.get("JOBLIB_BACKEND", "loky")               # 'loky' (processes) by default
+
+def _limit_context(n_threads):
+    """Caps BLAS threadpools (OpenBLAS/MKL/Accelerate) and reports before/after."""
+    class _Null:
+        def __enter__(self): return None
+        def __exit__(self, *a): return False
+    if threadpool_limits is None:
+        print(f"(threadpoolctl not available; cannot force BLAS threads to {n_threads})")
+        return _Null()
+    try:
+        before = [(d.get("internal_api"), d.get("num_threads")) for d in threadpool_info()]
+        print("BLAS pools before:", before)
+    except Exception:
+        pass
+    return threadpool_limits(limits=n_threads)
+
+def _print_parallel_plan():
+    print(f"Parallel plan → Grid jobs={GRID_JOBS}, BLAS per job={BLAS_PER_JOB}, backend={JOBLIB_BACKEND}")
+
 
 # -------------------- Helpers --------------------
 PIPELINE_CACHE = joblib.Memory(location=SKCACHE_DIR, verbose=0)
@@ -214,37 +250,12 @@ def safe_merge_params_into_results(res_sub: pd.DataFrame, params_df: pd.DataFram
     merged = merged.rename(columns={"subject_key":"subject", "pipeline_key":"pipeline"})
     return merged
 
-# -------------------- PARALLELISM PLAN --------------------
-def plan_parallelism(total_cores: int, mode: str):
-    """
-    Returns (eval_n_jobs, grid_n_jobs, fb_n_jobs, inner_threads_per_worker)
-    - inner_threads_per_worker: BLAS/OpenMP threads per joblib worker (via threadpoolctl)
-    """
-    total_cores = max(1, int(total_cores))
-    mode = (mode or "inner").lower()
-    if mode == "inner":
-        # GridSearch uses all, evaluation sequential -> fastest on Linux typically
-        return (1, total_cores, 1, 1)
-    elif mode == "outer":
-        # Evaluation uses all, GridSearch sequential
-        return (total_cores, 1, 1, 1)
-    elif mode == "both":
-        # Split, but cap product <= total_cores
-        eval_n = max(1, min(4, total_cores // 2))   # don't spawn too many outer workers
-        grid_n = max(1, total_cores // eval_n)
-        # Safety: ensure eval_n * grid_n <= total_cores
-        while eval_n * grid_n > total_cores and grid_n > 1:
-            grid_n -= 1
-        return (max(1, eval_n), max(1, grid_n), 1, 1)
-    else:
-        raise ValueError("--parallel_mode must be one of: inner, outer, both")
-
-# -------------------- CV builders (use global GRIDSEARCH_NJOBS later) --------------------
+# -------------------- CV builders --------------------
 inner_cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=RANDOM_STATE)
 DEV_BANDS = [[(7,13)],[(8,14)],[(9,15)],[(12,18)],[(14,22)],[(16,26)],[(8,30)]]
 
-def zhang_grid(clf="rbf_svm", use_selector=True, fb_n_jobs=1, grid_n_jobs=1):
-    base = make_zhang_pipeline(clf=clf, use_selector=use_selector, k_features=24, fb_n_jobs=fb_n_jobs)
+def zhang_grid(clf="rbf_svm", use_selector=True):
+    base = make_zhang_pipeline(clf=clf, use_selector=use_selector, k_features=24, fb_n_jobs=1)
     if clf == "rbf_svm":
         grid = {"select__k":[12,24,36], "csp__n_components":[2,4,6],
                 "clf__C":[0.5,1.0,2.0], "clf__gamma":["scale",0.05,0.1]}
@@ -259,11 +270,11 @@ def zhang_grid(clf="rbf_svm", use_selector=True, fb_n_jobs=1, grid_n_jobs=1):
         grid = {k:v for k,v in grid.items() if not k.startswith("select__")}
     return GridSearchCV(
         base, grid, scoring="balanced_accuracy", cv=inner_cv,
-        n_jobs=grid_n_jobs, refit=True, verbose=2, pre_dispatch=grid_n_jobs
+        n_jobs=GRID_JOBS, refit=True, verbose=2, pre_dispatch=GRID_JOBS
     )
 
-def dev_grid(clf="linear_svm", fb_n_jobs=1, grid_n_jobs=1):
-    base = make_dev_pipeline(band=(8,30), clf=clf, fb_n_jobs=fb_n_jobs)
+def dev_grid(clf="linear_svm"):
+    base = make_dev_pipeline(band=(8,30), clf=clf, fb_n_jobs=1)
     if clf == "linear_svm":
         grid = {"fb__filterbank":DEV_BANDS, "csp__n_components":[4,6,8], "clf__C":[0.25,1.0,4.0]}
     elif clf == "rbf_svm":
@@ -277,7 +288,7 @@ def dev_grid(clf="linear_svm", fb_n_jobs=1, grid_n_jobs=1):
         raise ValueError("Unsupported clf")
     return GridSearchCV(
         base, grid, scoring="balanced_accuracy", cv=inner_cv,
-        n_jobs=grid_n_jobs, refit=True, verbose=2, pre_dispatch=grid_n_jobs
+        n_jobs=GRID_JOBS, refit=True, verbose=2, pre_dispatch=GRID_JOBS
     )
 
 def assert_grid_matches_pipeline(name, gscv):
@@ -308,9 +319,13 @@ def predict_scores(est, X):
 
 def write_trial_predictions_for_subject(
     subj, dataset, paradigm, pipelines_dict, out_dir,
-    outer_splits=5, save_inner_val_preds=True, incremental=True,
-    inner_threads_per_worker=1
+    outer_splits=5, save_inner_val_preds=True, incremental=True
 ):
+    """
+    OUTER CV: always logs test predictions (cv_level='outer').
+    INNER CV: optionally logs validation predictions for tuned hyper-params (cv_level='inner').
+    If incremental=True, appends per outer fold so the CSV grows during the run.
+    """
     from sklearn.model_selection import StratifiedKFold
     outer_cv = StratifiedKFold(n_splits=outer_splits, shuffle=True, random_state=RANDOM_STATE)
 
@@ -335,13 +350,12 @@ def write_trial_predictions_for_subject(
         for train_idx, test_idx in outer_cv.split(X, y_enc):
             fold_id += 1
             est_fold = clone(est)
-            # Ensure BLAS threads are pinned inside worker tasks as well
-            with threadpool_limits(limits=inner_threads_per_worker):
+            with _limit_context(BLAS_PER_JOB), parallel_backend(JOBLIB_BACKEND, inner_max_num_threads=BLAS_PER_JOB):
                 est_fold.fit(X[train_idx], y_enc[train_idx])
-                est_infer = getattr(est_fold, "best_estimator_", est_fold)
+            est_infer = getattr(est_fold, "best_estimator_", est_fold)
 
-                # OUTER test predictions
-                y_pred_out, score_out = predict_scores(est_infer, X[test_idx])
+            # OUTER test predictions
+            y_pred_out, score_out = predict_scores(est_infer, X[test_idx])
             rows_outer = []
             for i_rel, i_abs in enumerate(test_idx):
                 row = {
@@ -378,9 +392,9 @@ def write_trial_predictions_for_subject(
                 for in_tr_idx, in_val_idx in inner.split(X_tr, y_tr):
                     inner_fold_id += 1
                     est_inner = clone(base_est)
-                    with threadpool_limits(limits=inner_threads_per_worker):
+                    with _limit_context(BLAS_PER_JOB), parallel_backend(JOBLIB_BACKEND, inner_max_num_threads=BLAS_PER_JOB):
                         est_inner.fit(X_tr[in_tr_idx], y_tr[in_tr_idx])
-                        y_pred_in, score_in = predict_scores(est_inner, X_tr[in_val_idx])
+                    y_pred_in, score_in = predict_scores(est_inner, X_tr[in_val_idx])
 
                     for i_rel, i_abs in enumerate(in_val_idx):
                         abs_idx = int(train_idx[i_abs])  # map back to global index
@@ -411,23 +425,18 @@ def write_trial_predictions_for_subject(
                     wrote_header = True
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] appended "
                       f"{len(rows_outer)+len(rows_inner)} rows → {out_path}")
+            else:
+                pass
 
     return out_path
 
 # -------------------- Main --------------------
 def main():
-    cpu_count = os.cpu_count() or 8
-
-    parser = argparse.ArgumentParser(description="Train BNCI2014_001 pipelines (parallel-optimized)")
+    parser = argparse.ArgumentParser(description="Train BNCI2014_001 pipelines (shared-preprocessing cache)")
     parser.add_argument("--subjects", type=str, default="1-9", help="e.g. '1-3,5,7' or '1-9' or None for all")
     parser.add_argument("--fmin", type=float, default=7.0)
     parser.add_argument("--fmax", type=float, default=30.0)
-    parser.add_argument("--parallel_mode", type=str, choices=["inner","outer","both"], default="inner",
-                        help="Where to parallelize: inner GridSearch, outer MOABB eval, or both (capped).")
-    parser.add_argument("--n_jobs", type=int, default=cpu_count,
-                        help="Total cores to use across all nested levels.")
-    parser.add_argument("--threads_per_worker", type=int, default=1,
-                        help="BLAS/OpenMP threads inside each joblib worker.")
+    parser.add_argument("--eval_njobs", type=int, default=int(os.environ.get("EVAL_NJOBS", "2")))
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--save_models", action="store_true", default=True)
@@ -438,15 +447,6 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints_bnci2014_001")
     args = parser.parse_args()
 
-    # Compute parallel plan
-    EVAL_NJOBS, GRIDSEARCH_NJOBS, FB_N_JOBS, INNER_THREADS = plan_parallelism(args.n_jobs, args.parallel_mode)
-    # Respect --threads_per_worker if user overrides
-    INNER_THREADS = max(1, int(args.threads_per_worker))
-
-    print(f"[Parallel plan] mode={args.parallel_mode} | total_cores={args.n_jobs} "
-          f"| eval_n_jobs={EVAL_NJOBS} | grid_n_jobs={GRIDSEARCH_NJOBS} "
-          f"| fb_n_jobs={FB_N_JOBS} | threads/worker={INNER_THREADS}")
-
     CHECKPOINT_DIR = args.checkpoint_dir
     MODELS_DIR = os.path.join(CHECKPOINT_DIR, "models")
     PRED_DIR   = os.path.join(CHECKPOINT_DIR, "predictions")
@@ -456,20 +456,20 @@ def main():
 
     def ck_path(subj): return os.path.join(CHECKPOINT_DIR, f"bnci2014_001_subject_{int(subj):02d}.csv")
 
-    # Build pipelines (all share the same Memory cache); only n_jobs knobs changed
+    # Build pipelines (all share the same Memory cache)
     pipelines = {
-        "Zhang_FBCSP_MI_RBFSVM_CV":    zhang_grid("rbf_svm",   use_selector=True,  fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Zhang_FBCSP_MI_LinSVM_CV":    zhang_grid("linear_svm",use_selector=True,  fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Zhang_FBCSP_MI_LDA_CV":       zhang_grid("lda",       use_selector=True,  fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Zhang_FBCSP_MI_GNB_CV":       zhang_grid("gnb",       use_selector=True,  fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Zhang_FBCSP_noFS_RBFSVM_CV":  zhang_grid("rbf_svm",   use_selector=False, fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Zhang_FBCSP_noFS_LinSVM_CV":  zhang_grid("linear_svm",use_selector=False, fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Dev_CSP_LinSVM_CV":           dev_grid("linear_svm",  fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Dev_CSP_RBFSVM_CV":           dev_grid("rbf_svm",     fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
-        "Dev_CSP_LDA_CV":              dev_grid("lda",         fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS),
+        "Zhang_FBCSP_MI_RBFSVM_CV": zhang_grid("rbf_svm", use_selector=True),
+        "Zhang_FBCSP_MI_LinSVM_CV": zhang_grid("linear_svm", use_selector=True),
+        "Zhang_FBCSP_MI_LDA_CV":    zhang_grid("lda", use_selector=True),
+        "Zhang_FBCSP_MI_GNB_CV":    zhang_grid("gnb", use_selector=True),
+        "Zhang_FBCSP_noFS_RBFSVM_CV": zhang_grid("rbf_svm", use_selector=False),
+        "Zhang_FBCSP_noFS_LinSVM_CV": zhang_grid("linear_svm", use_selector=False),
+        "Dev_CSP_LinSVM_CV": dev_grid("linear_svm"),
+        "Dev_CSP_RBFSVM_CV": dev_grid("rbf_svm"),
+        "Dev_CSP_LDA_CV":    dev_grid("lda"),
     }
     if HAVE_MORD:
-        pipelines["Dev_CSP_Ordinal_CV"] = dev_grid("ordinal", fb_n_jobs=FB_N_JOBS, grid_n_jobs=GRIDSEARCH_NJOBS)
+        pipelines["Dev_CSP_Ordinal_CV"] = dev_grid("ordinal")
 
     for name, g in pipelines.items():
         assert_grid_matches_pipeline(name, g)
@@ -480,134 +480,129 @@ def main():
     if not subjects:
         raise RuntimeError("No valid subjects to run.")
     print("Subjects:", subjects)
-
-    # ---- Core run contexts: limit inner threads and force loky backend
-    backend_ctx = parallel_backend("loky", inner_max_num_threads=INNER_THREADS)
-    threads_ctx = threadpool_limits(limits=INNER_THREADS)
+    print(f"GRID_JOBS={GRID_JOBS} | BLAS_PER_JOB={BLAS_PER_JOB} | EVAL_NJOBS={args.eval_njobs}")
 
     # Loop subjects
     start_all = time.perf_counter()
-    with backend_ctx, threads_ctx:
-        for subj in subjects:
-            subj = int(subj)
-            # Skip if checkpoint exists (still write predictions if missing)
-            ck = ck_path(subj)
-            if args.resume and os.path.exists(ck):
-                try:
-                    tmp = pd.read_csv(ck)
-                    if not tmp.empty:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] SKIP subject {subj} (checkpoint exists)")
-                        if args.write_predictions:
-                            pred_csv = os.path.join(PRED_DIR, f"bnci2014_001_subject_{int(subj):02d}_trial_predictions.csv")
-                            if not os.path.exists(pred_csv):
-                                dataset = BNCI2014_001(); dataset.subject_list = [subj]
-                                paradigm = MotorImagery(n_classes=4, fmin=args.fmin, fmax=args.fmax)
-                                _ = write_trial_predictions_for_subject(
-                                    subj, dataset, paradigm, pipelines, PRED_DIR,
-                                    outer_splits=args.outer_splits, save_inner_val_preds=args.save_inner_val_preds,
-                                    incremental=True, inner_threads_per_worker=INNER_THREADS
-                                )
-                        continue
-                except Exception:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: unreadable checkpoint; re-running subject {subj}")
-
-            dataset = BNCI2014_001(); dataset.subject_list = [subj]
-            paradigm = MotorImagery(n_classes=4, fmin=args.fmin, fmax=args.fmax)
-            evaluation = WithinSessionEvaluation(
-                paradigm=paradigm, datasets=[dataset], overwrite=True,
-                n_jobs=EVAL_NJOBS, hdf5_path=os.path.join(CHECKPOINT_DIR, "models")
-            )
-
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] START eval subject {subj} …")
-            t0 = time.perf_counter()
+    for subj in subjects:
+        subj = int(subj)
+        # Skip if checkpoint exists (still write predictions if missing)
+        ck = ck_path(subj)
+        if args.resume and os.path.exists(ck):
             try:
+                tmp = pd.read_csv(ck)
+                if not tmp.empty:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] SKIP subject {subj} (checkpoint exists)")
+                    if args.write_predictions:
+                        pred_csv = os.path.join(PRED_DIR, f"bnci2014_001_subject_{int(subj):02d}_trial_predictions.csv")
+                        if not os.path.exists(pred_csv):
+                            dataset = BNCI2014_001(); dataset.subject_list = [subj]
+                            paradigm = MotorImagery(n_classes=4, fmin=args.fmin, fmax=args.fmax)
+                            _ = write_trial_predictions_for_subject(
+                                subj, dataset, paradigm, pipelines, PRED_DIR,
+                                outer_splits=args.outer_splits, save_inner_val_preds=args.save_inner_val_preds, incremental=True
+                            )
+                    continue
+            except Exception:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: unreadable checkpoint; re-running subject {subj}")
+
+        dataset = BNCI2014_001(); dataset.subject_list = [subj]
+        paradigm = MotorImagery(n_classes=4, fmin=args.fmin, fmax=args.fmax)
+        evaluation = WithinSessionEvaluation(
+            paradigm=paradigm, datasets=[dataset], overwrite=True,
+            n_jobs=args.eval_njobs, hdf5_path=os.path.join(CHECKPOINT_DIR, "models")
+        )
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] START eval subject {subj} …")
+        t0 = time.perf_counter()
+        try:
+            with _limit_context(BLAS_PER_JOB), parallel_backend(JOBLIB_BACKEND, inner_max_num_threads=BLAS_PER_JOB):
+                _print_parallel_plan()
                 res_sub = evaluation.process(pipelines)  # MOABB results DF (outer CV)
-                if 'subject' not in res_sub.columns:
-                    res_sub['subject'] = int(subj)
+            if 'subject' not in res_sub.columns:
+                res_sub['subject'] = int(subj)
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL eval subject {subj}: {type(e).__name__}: {e}")
+            del evaluation, dataset; gc.collect()
+            continue
+
+        # Fit final models on all data + save inner CV grids + models
+        param_rows = []
+        if args.save_models:
+            try:
+                X, y, meta = paradigm.get_data(dataset=dataset, subjects=[subj])
+                y_fit, label_map = encode_labels(y, meta, force_zero_based=True)
+
+                for name, est in pipelines.items():
+                    est_fit = clone(est)
+                    fit_error = None
+                    saved = {"ok": False, "path": None, "format": None, "error": None}
+                    best_params = None
+                    est_obj = None
+                    pipe_dir = os.path.join(MODELS_DIR := os.path.join(CHECKPOINT_DIR, "models"), name, f"subject-{int(subj):02d}")
+                    os.makedirs(pipe_dir, exist_ok=True)
+
+                    try:
+                        with _limit_context(BLAS_PER_JOB), parallel_backend(JOBLIB_BACKEND, inner_max_num_threads=BLAS_PER_JOB):
+                            est_fit.fit(X, y_fit)
+                        if hasattr(est_fit, "cv_results_"):
+                            try:
+                                cv_df = pd.DataFrame(est_fit.cv_results_)
+                                cv_df.to_csv(os.path.join(pipe_dir, "inner_cv_results.csv"), index=False)
+                            except Exception as e_cv:
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: inner_cv_results save failed ({name}, subj {subj}): {e_cv}")
+
+                        if hasattr(est_fit, "best_params_"):
+                            best_params = est_fit.best_params_
+                        if hasattr(est_fit, "best_estimator_") and args.save_only_best:
+                            est_obj = est_fit.best_estimator_
+                        else:
+                            est_obj = est_fit
+
+                        saved = save_model_any(est_obj, pipe_dir, "model")
+
+                    except Exception as e_fit:
+                        fit_error = f"{type(e_fit).__name__}: {e_fit}"
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: fit failed (subject {subj}, pipeline {name}): {fit_error}")
+                        print(traceback.format_exc(limit=2))
+
+                    row = {
+                        "subject": int(subj),
+                        "pipeline": str(name),
+                        "label_mapping_json": json.dumps(label_map),
+                        "model_saved": saved["ok"],
+                        "model_path": saved["path"],
+                        "model_format": saved["format"],
+                        "fit_error": fit_error,
+                    }
+                    row.update(flatten_params(best_params))
+                    param_rows.append(row)
+
             except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL eval subject {subj}: {type(e).__name__}: {e}")
-                del evaluation, dataset; gc.collect()
-                continue
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: data fetch/save block failed for subject {subj}: {type(e).__name__}: {e}")
 
-            # Fit final models on all data + save inner CV grids + models
-            param_rows = []
-            if args.save_models:
-                try:
-                    X, y, meta = paradigm.get_data(dataset=dataset, subjects=[subj])
-                    y_fit, label_map = encode_labels(y, meta, force_zero_based=True)
+        # Merge params into MOABB results
+        if param_rows:
+            params_df = pd.DataFrame(param_rows)
+            res_sub = safe_merge_params_into_results(res_sub, params_df)
 
-                    for name, est in pipelines.items():
-                        est_fit = clone(est)
-                        fit_error = None
-                        saved = {"ok": False, "path": None, "format": None, "error": None}
-                        best_params = None
-                        est_obj = None
-                        pipe_dir = os.path.join(MODELS_DIR := os.path.join(CHECKPOINT_DIR, "models"),
-                                                name, f"subject-{int(subj):02d}")
-                        os.makedirs(pipe_dir, exist_ok=True)
+        # Write per-subject MOABB CSV
+        ck = ck_path(subj)
+        res_sub.to_csv(ck, index=False)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] DONE eval subject {subj} in {(time.perf_counter()-t0)/60:.1f} min → {ck} (rows={len(res_sub)})")
 
-                        try:
-                            with threadpool_limits(limits=INNER_THREADS):
-                                est_fit.fit(X, y_fit)
-                            if hasattr(est_fit, "cv_results_"):
-                                try:
-                                    cv_df = pd.DataFrame(est_fit.cv_results_)
-                                    cv_df.to_csv(os.path.join(pipe_dir, "inner_cv_results.csv"), index=False)
-                                except Exception as e_cv:
-                                    print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: inner_cv_results save failed ({name}, subj {subj}): {e_cv}")
+        # Per-trial predictions (incremental append)
+        if args.write_predictions:
+            try:
+                _ = write_trial_predictions_for_subject(
+                    subj, dataset, paradigm, pipelines, os.path.join(CHECKPOINT_DIR, "predictions"),
+                    outer_splits=args.outer_splits, save_inner_val_preds=args.save_inner_val_preds, incremental=True
+                )
+            except Exception as e_pred:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: per-trial predictions failed for subject {subj}: {e_pred}")
 
-                            if hasattr(est_fit, "best_params_"):
-                                best_params = est_fit.best_params_
-                            if hasattr(est_fit, "best_estimator_") and args.save_only_best:
-                                est_obj = est_fit.best_estimator_
-                            else:
-                                est_obj = est_fit
-
-                            saved = save_model_any(est_obj, pipe_dir, "model")
-
-                        except Exception as e_fit:
-                            fit_error = f"{type(e_fit).__name__}: {e_fit}"
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: fit failed (subject {subj}, pipeline {name}): {fit_error}")
-                            print(traceback.format_exc(limit=2))
-
-                        row = {
-                            "subject": int(subj),
-                            "pipeline": str(name),
-                            "label_mapping_json": json.dumps(label_map),
-                            "model_saved": saved["ok"],
-                            "model_path": saved["path"],
-                            "model_format": saved["format"],
-                            "fit_error": fit_error,
-                        }
-                        row.update(flatten_params(best_params))
-                        param_rows.append(row)
-
-                except Exception as e:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: data fetch/save block failed for subject {subj}: {type(e).__name__}: {e}")
-
-            # Merge params into MOABB results
-            if param_rows:
-                params_df = pd.DataFrame(param_rows)
-                res_sub = safe_merge_params_into_results(res_sub, params_df)
-
-            # Write per-subject MOABB CSV
-            ck = ck_path(subj)
-            res_sub.to_csv(ck, index=False)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] DONE eval subject {subj} in {(time.perf_counter()-t0)/60:.1f} min → {ck} (rows={len(res_sub)})")
-
-            # Per-trial predictions (incremental append)
-            if args.write_predictions:
-                try:
-                    _ = write_trial_predictions_for_subject(
-                        subj, dataset, paradigm, pipelines, os.path.join(CHECKPOINT_DIR, "predictions"),
-                        outer_splits=args.outer_splits, save_inner_val_preds=args.save_inner_val_preds,
-                        incremental=True, inner_threads_per_worker=INNER_THREADS
-                    )
-                except Exception as e_pred:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] WARN: per-trial predictions failed for subject {subj}: {e_pred}")
-
-            del evaluation, dataset
-            gc.collect()
+        del evaluation, dataset
+        gc.collect()
 
     # Merge subjects (MOABB results)
     files = sorted(glob.glob(os.path.join(CHECKPOINT_DIR, "bnci2014_001_subject_*.csv")))
@@ -636,4 +631,7 @@ def main():
     print("Predictions dir:", pred_dir)
 
 if __name__ == "__main__":
+    # late imports used by helpers
+    import numpy as np
+    import pandas as pd
     main()
