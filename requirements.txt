@@ -1,0 +1,10 @@
+moabb
+numpy
+scikit-learn
+scipy
+pandas
+mne 
+matplotlib
+joblib
+pyriemann
+mord
